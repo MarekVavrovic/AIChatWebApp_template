@@ -1,0 +1,230 @@
+﻿@page "/"
+@using System.ComponentModel
+
+@*This is from Microsoft.Extensions.AI*@
+@inject IChatClient ChatClient 
+
+@inject NavigationManager Nav
+
+@*Used in SearchAsync*@
+@inject SemanticSearch Search
+
+@implements IDisposable
+
+<PageTitle>Chat</PageTitle>
+
+<ChatHeader OnNewChat="@ResetConversationAsync" /> @*AI Chat Web App *@
+
+<ChatMessageList Messages="@messages" InProgressMessage="@currentResponseMessage">
+    
+    <NoMessagesContent>
+        
+        <div>
+            The .NET AI Chat template is designed to help you quickly build an AI-powered chat application we can chat with <b>Local Custom Data</b>.
+            Try asking about something related to these example documents (stored in the data folder located in wwwroot)
+            
+            <hr/>
+            
+            @*These files are located in the Data folder of wwwroot*@
+            <ChatCitation File="EmergencyKit.pdf" />
+            <ChatCitation File="VS2022IssueFix.pdf" />
+            <ChatCitation File="ASPNETvsWebform.pdf" />
+         
+           
+            <br/><br/>
+
+           <hr/>
+
+            This application uses <b>Retrieval-Augmented Generation (RAG)</b> to provide answers based on your custom data.
+            RAG works by first retrieving relevant information from internal knowledge bases or documents,
+            and then providing this retrieved content as additional context to the LLM before it generates its answer.
+            This allows LLMs to access up-to-date and domain-specific information not present in their original training data,
+            leading to more accurate, factual, and trustworthy outputs.
+
+            <br /><br />
+            
+            <b>NEW ... </b>This updated template now includes examples of custom functions that can be used as tools by the LLM (Find Temperature for a given Location)
+            <br /><br />            
+
+            <b>Note: </b>If you move the app to a different location, <b>erase</b> the ingestion cache files (ingestioncache.db ...) ... these will be recreated in the new location
+        </div>       
+
+    </NoMessagesContent>
+
+</ChatMessageList>
+
+<div class="chat-container">
+
+    @*This will display the followup questions*@
+    <ChatSuggestions OnSelected="@AddUserMessageAsync" @ref="@chatSuggestions" />
+    
+    @*This is the main input *@
+    <ChatInput OnSend="@AddUserMessageAsync" @ref="@chatInput" />
+     
+    <SurveyPrompt />     
+
+</div>
+
+@code {
+    private const string SystemPrompt = @"
+        You are an assistant who answers questions about information you retrieve.
+        Do not answer questions about anything else. Only supply information based on search results, not based on your existing knowledge.
+        Use only simple markdown to format your responses.
+
+        Use the search tool to find relevant information. When you do this, end your
+        reply with citations in the special XML format:
+
+        <citation filename='string' page_number='number'>exact quote here</citation>
+
+        Always include the citation in your response if there are results.
+
+        The quote must be max 5 words, taken word-for-word from the search result, and is the basis for why the citation is relevant.
+        Don't refer to the presence of citations; just emit these tags right at the end, with no surrounding text.
+
+        If you cannot find any relevant information, say 'I could not find any information on that topic.'
+     
+";
+
+    private readonly ChatOptions chatOptions = new();               // Options for the chat request to the LLM
+    private readonly List<ChatMessage> messages = new();            // The conversation history between user and assistant
+    private CancellationTokenSource? currentResponseCancellation;   // Used to cancel the current response from the LLM
+    private ChatMessage? currentResponseMessage;                    // The response currently being streamed from the LLM
+    private ChatInput? chatInput;                                   // Reference to the ChatInput component to set focus
+    private ChatSuggestions? chatSuggestions;                       // Reference to the ChatSuggestions component to update suggestions
+
+    protected override void OnInitialized()
+    {
+        // Start the conversation with a System message containing the SystemPrompt
+        // System: Sets the rules, instructions, or context for the conversation. It's not a participant, but more like a moderator or guide for the AI.
+        // User: Represents the person interacting with the AI (you or your app's users).
+        // Assistant: Represents the AI itself — the entity that responds to user messages.
+        messages.Add(new(ChatRole.System, SystemPrompt));
+
+        // Add the SearchAsync function as a tool available to the LLM (... plus new other custom functions)
+        // This enables Retrieval Augmented Generation (RAG)
+        // The chatOptions is passed to GetStreamingResponseAsync in AddUserMessageAsync
+        chatOptions.Tools = [
+                AIFunctionFactory.Create(SearchAsync),
+                AIFunctionFactory.Create(GetLatitudeLongitude),         // Custom function to get latitude and longitude for a location
+                AIFunctionFactory.Create(GetTemperature)                // Custom function to get the current temperature for specified latitude and longitude
+        ];
+    }
+
+    private async Task AddUserMessageAsync(ChatMessage userMessage)
+    {
+        CancelAnyCurrentResponse();
+
+        // Add the user message to the conversation and clear suggestions and focus the input box
+        messages.Add(userMessage);
+        chatSuggestions?.Clear();
+        await chatInput!.FocusAsync();
+
+        // Stream and display a new response from the IChatClient (the LLM) based on the conversation so far
+        var responseText = new TextContent("");                                         // TextContent allows appending text as it streams in 
+        currentResponseMessage = new ChatMessage(ChatRole.Assistant, [responseText]);   // Create a new Assistant message with the streaming text content
+        currentResponseCancellation = new();                                            // Create a new CancellationTokenSource for this response
+
+        // Stream the response from the chat client (LLM) and append each chunk to the responseText
+        // Note that the chatOptions includes the SearchAsync tool for RAG
+        await foreach (var chunk in ChatClient.GetStreamingResponseAsync(messages, chatOptions, currentResponseCancellation.Token))
+        {
+            responseText.Text += chunk.Text;
+            ChatMessageItem.NotifyChanged(currentResponseMessage);
+        }
+
+        // Store the final response in the conversation, and begin getting suggestions based on the updated conversation
+        messages.Add(currentResponseMessage!);
+        currentResponseMessage = null;
+        chatSuggestions?.Update(messages);
+    }
+
+    private void CancelAnyCurrentResponse()
+    {
+        // If a response was cancelled while streaming, include it in the conversation so it's not lost
+        if (currentResponseMessage is not null)
+        {
+            messages.Add(currentResponseMessage);
+        }
+
+        currentResponseCancellation?.Cancel();
+        currentResponseMessage = null;
+    }
+
+    private async Task ResetConversationAsync()
+    {
+        CancelAnyCurrentResponse();
+        messages.Clear();
+        messages.Add(new(ChatRole.System, SystemPrompt));
+        chatSuggestions?.Clear();
+        await chatInput!.FocusAsync();
+    }
+
+
+    //This is an example of RAG (Retrieval Augmented Generation) 
+    //This C# function Searches the local data (ingested) store for relevant information it is made available to the LLM as a tool
+
+    // The Description Attribute helps the AI model understand:
+    // What the function does("Searches for information using a phrase or keyword")
+    // What parameters it expects and their purpose
+
+    [Description("Searches for information using a phrase or keyword")]
+    private async Task<IEnumerable<string>> SearchAsync(
+        [Description("The phrase to search for.")] string searchPhrase,
+        [Description("Whenever possible, specify the filename to search that file only. If not provided, the search includes all files.")] string? filenameFilter = null)
+    {
+        // Limit to top 5 results to reduce context size sent to LLM
+        // SearchAsync is called by the LLM via the chatOptions.Tools added in OnInitialized
+        // Search.SearchAsync uses the SemanticSearch service registered in Program.cs and defined in Services/SemanticSearch.cs
+        // The SemanticSearch service uses the embeddings model to convert the searchPhrase into a vector
+        // Search was injected at the top of this file
+        await InvokeAsync(StateHasChanged);
+        var results = await Search.SearchAsync(searchPhrase, filenameFilter, maxResults: 5);
+        return results.Select(result =>
+            $"<result filename=\"{result.FileName}\" page_number=\"{result.PageNumber}\">{result.Text}</result>");
+    } 
+
+    //This is an example of custom functions that could be used as a tool by the LLM
+    
+    //The first function gets the latitude and longitude for a specified location using a geocoding API
+    //The second function gets the current temperature for the specified latitude and longitude using a weather API
+    
+    //These functions are made available to the LLM as tools via the chatOptions.Tools added in OnInitialized
+
+    [Description("Gets the current temperature for a specified location.")]
+    private async Task<GeocodingResult?> GetLatitudeLongitude(string location)
+    {
+        var response = await new HttpClient()
+        .GetFromJsonAsync<GeocodingResponse>($"https://geocoding-api.open-meteo.com/v1/search?name={Uri.EscapeDataString(location)}&count=1");
+        return response!.Results?.FirstOrDefault();
+    }
+
+    record GeocodingResponse(GeocodingResult[] Results);
+    record GeocodingResult(string Name,float Latitude,float Longitude);
+
+    //public class GeocodingResult
+    //{
+    //      public string Name { get; }
+    //      public float Latitude { get; }
+    //      public float Longitude { get; }
+
+    //      public GeocodingResult(string name, float latitude, float longitude)
+    //      {
+    //          Name = name;
+    //          Latitude = latitude;
+    //          Longitude = longitude;
+    //      }
+    //}
+
+    private async Task<float?> GetTemperature(float latitude,float longitude)
+    {
+        var response = await new HttpClient()
+        .GetFromJsonAsync<WeatherResponse>($"https://api.open-meteo.com/v1/forecast?latitude={latitude}&longitude={longitude}&daily=temperature_2m_max");    
+        return response?.Daily.Temperature_2m_Max.FirstOrDefault(); 
+    }
+
+    record WeatherResponse(WeatherReports Daily);
+    record WeatherReports(float[] Temperature_2m_Max);
+
+    public void Dispose()
+        => currentResponseCancellation?.Cancel();
+}
